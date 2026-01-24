@@ -1,0 +1,252 @@
+# main.py
+from fastapi import FastAPI, Request, Header, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
+from typing import Optional, Any, Dict
+import os
+import logging
+import json
+from datetime import datetime, timezone
+import uuid
+
+from sqlalchemy import create_engine, text, MetaData, Table, Column, String, Integer, Float, DateTime, Boolean, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+
+import httpx
+import urllib.request
+
+from google.cloud import tasks_v2  # ancora usato per /tick mock
+
+import executor  # il nostro motore “sporco”
+
+
+# ======================
+# CONFIG DB & FASTAPI
+# ======================
+
+app = FastAPI(title="Cerbero Coordinator v2")
+
+def _project_id():
+    return (os.getenv('GOOGLE_CLOUD_PROJECT') or
+            os.getenv('GCP_PROJECT') or
+            os.getenv('PROJECT_ID') or
+            os.getenv('COSCIENZA_PROJECT_ID'))
+
+
+SQL_USER = os.getenv("SQL_DB_USER")
+SQL_PASS = os.getenv("SQL_DB_PASS")
+SQL_NAME = os.getenv("SQL_DB_NAME")
+INSTANCE_CONNECTION_NAME = os.getenv("SQL_INSTANCE_CONN")  # es. new-cerbero:europe-west8:coscienza-db
+
+HOST = f"/cloudsql/{INSTANCE_CONNECTION_NAME}"
+DB_URL = f"postgresql+psycopg://{SQL_USER}:{SQL_PASS}@/{SQL_NAME}?host={HOST}"
+
+engine = create_engine(DB_URL, pool_pre_ping=True)
+metadata = MetaData()
+
+tenants = Table(
+    "tenants", metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("email", String(255), nullable=False, unique=True),
+    Column("stripe_customer_id", String(255)),
+    Column("created_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False),
+)
+
+contracts = Table(
+    "contracts", metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("tenant_id", PG_UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False),
+    Column("arbitrum_address", String(64), nullable=False),
+    Column("status", String(32), nullable=False, default="inactive"),
+    Column("deposit_cap_eur", Integer, nullable=False, default=999),
+    Column("created_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False),
+)
+
+signals = Table(
+    "signals", metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("symbol", String(16), nullable=False),
+    Column("score", Float, nullable=False),
+    Column("p", Float, nullable=False),
+    Column("e", Float, nullable=False),
+    Column("r", Float, nullable=False),
+    Column("v", Float, nullable=False),
+    Column("created_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False),
+)
+
+jobs = Table(
+    "jobs", metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("tenant_id", PG_UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False),
+    Column("signal_id", PG_UUID(as_uuid=True), ForeignKey("signals.id")),
+    Column("status", String(32), nullable=False, default="pending"),
+    Column("created_at", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False),
+)
+
+PYTH_HERMES_URL = os.getenv("PYTH_HERMES_URL", "https://hermes.pyth.network")
+
+COORD_API_KEY = os.getenv("COORDINATOR_API_KEY", "")  # usata per X-API-Key
+
+
+# ======================
+# MODELLI Pydantic
+# ======================
+
+class TradeIntentMeta(BaseModel):
+    source: Optional[str] = None
+    model_version: Optional[str] = None
+    mtf_status: Optional[str] = None
+    context_ok: Optional[bool] = None
+
+
+class TradeIntentIn(BaseModel):
+    symbol: str = Field(..., description="ES: EURUSD, XAUUSD, BTCUSD")
+    timeframe: str = Field(..., description="ES: 5m, 15m, 4h, 1d")
+    direction: str = Field(..., regex="^(LONG|SHORT)$")
+    strength_class: str = Field(..., description="Es: A, A_PLUS")
+    risk_pct: float = Field(..., gt=0, description="Es: 0.008 per 0.8%")
+    ts_signal: str = Field(..., description="ISO8601 UTC timestamp")
+    user_id: Optional[str] = Field("TEST_USER_001", description="ID utente/tenant")
+    meta: Optional[TradeIntentMeta] = None
+
+
+# ======================
+# ENDPOINT DI BASE
+# ======================
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
+
+
+@app.get("/dbtest", response_class=PlainTextResponse)
+def dbtest():
+    with engine.connect() as conn:
+        one = conn.execute(text("SELECT 1")).scalar_one()
+        return f"db:{one}"
+
+
+@app.post("/migrate", response_class=PlainTextResponse)
+def migrate():
+    metadata.create_all(engine)
+    return "migrated"
+
+
+@app.post("/worker", response_class=PlainTextResponse)
+def worker():
+    # placeholder: in futuro processeremo il job (trade singolo utente) in modo async
+    return "worker-ack"
+
+
+# ======================
+# MOCK /tick (puoi tenerlo per test interni)
+# ======================
+
+@app.post("/tick", response_class=PlainTextResponse)
+async def tick():
+    try:
+        REGION_TASKS = "europe-west1"
+        QUEUE_ID = "coordinatore-dispatch"
+        SERVICE_URL = os.getenv("SERVICE_URL")
+        SA_TASKS = os.getenv("SA_TASKS_EMAIL")
+        PROJECT = _project_id()
+        if not PROJECT:
+            raise RuntimeError("Missing project id env")
+
+        # qui potresti riusare la pipeline mock, ma non è più critica; la Coscienza parlerà con /v1/trade-intent
+        return "tick-disabled: use /v1/trade-intent from Coscienza v3"
+    except Exception as e:
+        logging.exception("tick failed")
+        return PlainTextResponse(f"tick-error: {e}", status_code=500)
+
+
+# ======================
+# ARBI BLOCK (già usato)
+# ======================
+
+@app.get("/arbi/block")
+def arbi_block():
+    url = os.environ.get("ALCHEMY_HTTP_ARBITRUM") or os.environ.get("ARBITRUM_RPC_URL")
+    if not url:
+        raise HTTPException(status_code=500, detail="ALCHEMY_HTTP_ARBITRUM/ARBITRUM_RPC_URL not set")
+    body = {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"content-type":"application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        payload = json.loads(r.read().decode())
+    res = payload.get("result")
+    height = int(res, 16) if isinstance(res, str) else None
+    return {"ok": True, "height": height, "result": res}
+
+
+# ======================
+# PYTH PRICE HELPER (ancora esposto)
+# ======================
+
+@app.get("/pyth/price")
+async def pyth_price(id: str = Query(..., description="Pyth price feed id (0x...)")):
+    """Chiama Hermes con un singolo feed id e ritorna il last price."""
+    try:
+        url_base = (globals().get("PYTH_HERMES_URL")
+                    or os.environ.get("PYTH_HERMES_URL")
+                    or "https://hermes.pyth.network")
+        if not id.startswith("0x") or len(id) < 10:
+            raise HTTPException(status_code=400, detail="invalid feed id")
+        url = url_base.rstrip("/") + "/api/latest_price_feeds"
+        params = {"ids[]": [id]}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+        if not data:
+            return {"ok": False, "id": id, "reason": "not found"}
+        item = data[0]
+        price = item.get("price", {})
+        px, expo = price.get("price"), price.get("expo", 0)
+        out = float(px) * (10 ** float(expo)) if px is not None else None
+        return {"ok": True, "id": id, "price": out, "raw": item}
+    except httpx.HTTPError as e:
+        logging.exception("hermes http error")
+        raise HTTPException(status_code=502, detail=f"hermes error: {e}") from e
+    except Exception as e:
+        logging.exception("pyth_price failed")
+        raise HTTPException(status_code=500, detail=f"internal error: {e}") from e
+
+
+# ======================
+# 🔥 /v1/trade-intent – cuore dell’autotrader
+# ======================
+
+@app.post("/v1/trade-intent")
+async def v1_trade_intent(
+    intent: TradeIntentIn,
+    x_api_key: Optional[str] = Header(None, convert_underscores=False)
+):
+    # 1) AUTH
+    if COORD_API_KEY:
+        if not x_api_key or x_api_key != COORD_API_KEY:
+            raise HTTPException(status_code=401, detail="invalid api key")
+
+    # 2) Validazione simbolo & direzione
+    symbol = intent.symbol.upper()
+    if symbol not in executor.COSCIENZA_SYMBOLS_V3:
+        raise HTTPException(status_code=400, detail=f"symbol {symbol} not in allowed universe")
+
+    # 3) Serializza intent in dict “piatto”
+    intent_dict: Dict[str, Any] = intent.model_dump()
+    intent_dict["symbol"] = symbol
+
+    try:
+        result = await executor.process_trade_intent(engine, intent_dict)
+        return result
+    except Exception as e:
+        logging.exception("process_trade_intent failed")
+        return {
+            "intent_id": None,
+            "status": "ERROR",
+            "message": str(e),
+        }

@@ -1,0 +1,605 @@
+# main.py
+from fastapi import FastAPI, Request, Header, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
+from typing import Optional, Any, Dict
+import os
+import logging
+import json
+from datetime import datetime, timezone
+import uuid
+
+from sqlalchemy import (
+    create_engine,
+    text,
+    MetaData,
+    Table,
+    Column,
+    String,
+    Integer,
+    Float,
+    DateTime,
+    Boolean,
+    ForeignKey,
+)
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+
+import httpx
+import urllib.request
+
+from google.cloud import tasks_v2  # ancora usato solo per vecchio /tick (ora disabilitato)
+
+import router_cefi as executor  # CeFi router (governor + forward)
+
+
+# ======================
+# CONFIG DB & FASTAPI
+# ======================
+
+app = FastAPI(title="Cerbero Coordinator v2")
+
+
+def _project_id():
+    return (
+        os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCP_PROJECT")
+        or os.getenv("PROJECT_ID")
+        or os.getenv("COSCIENZA_PROJECT_ID")
+    )
+
+
+SQL_USER = os.getenv("SQL_DB_USER")
+SQL_PASS = os.getenv("SQL_DB_PASS") or os.getenv("DB_PASSWORD")
+SQL_NAME = os.getenv("SQL_DB_NAME")
+SQL_HOST = os.getenv("SQL_DB_HOST")  # es: 34.154.xx.xx
+
+if not (SQL_USER and SQL_PASS and SQL_NAME and SQL_HOST):
+    logging.warning("DB env incomplete, some DB endpoints may fail")
+    engine = None
+else:
+    DB_URL = f"postgresql+psycopg://{SQL_USER}:{SQL_PASS}@{SQL_HOST}/{SQL_NAME}"
+    engine = create_engine(DB_URL, pool_pre_ping=True)
+
+metadata = MetaData()
+
+tenants = Table(
+    "tenants",
+    metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("email", String(255), nullable=False, unique=True),
+    Column("stripe_customer_id", String(255)),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    ),
+)
+
+contracts = Table(
+    "contracts",
+    metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("tenant_id", PG_UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False),
+    Column("arbitrum_address", String(64), nullable=False),
+    Column("status", String(32), nullable=False, default="inactive"),
+    Column("deposit_cap_eur", Integer, nullable=False, default=999),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    ),
+)
+
+signals = Table(
+    "signals",
+    metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("symbol", String(16), nullable=False),
+    Column("score", Float, nullable=False),
+    Column("p", Float, nullable=False),
+    Column("e", Float, nullable=False),
+    Column("r", Float, nullable=False),
+    Column("v", Float, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    ),
+)
+
+jobs = Table(
+    "jobs",
+    metadata,
+    Column("id", PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
+    Column("tenant_id", PG_UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False),
+    Column("signal_id", PG_UUID(as_uuid=True), ForeignKey("signals.id")),
+    Column("status", String(32), nullable=False, default="pending"),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    ),
+)
+
+PYTH_HERMES_URL = os.getenv("PYTH_HERMES_URL", "https://hermes.pyth.network")
+ADMIN_SEED_KEY = os.getenv("ADMIN_SEED_KEY", "")
+
+COORD_API_KEY = os.getenv("COORDINATOR_API_KEY", "")  # usata per X-API-Key
+
+# ======================
+# METAAPI (for reconciler)
+# ======================
+METAAPI_TOKEN = (os.getenv("METAAPI_TOKEN", "") or "").strip()
+METAAPI_API_BASE = (os.getenv("METAAPI_API_BASE", "") or "https://mt-client-api-v1.new-york.agiliumtrade.ai").strip().rstrip("/")
+
+
+
+# ======================
+# MODELLI Pydantic
+# ======================
+
+class TradeIntentMeta(BaseModel):
+    source: Optional[str] = None
+    model_version: Optional[str] = None
+    mtf_status: Optional[str] = None
+    context_ok: Optional[bool] = None
+
+
+class TradeIntentIn(BaseModel):
+    symbol: str = Field(..., description="ES: EURUSD, XAUUSD, BTCUSD")
+    timeframe: str = Field(..., description="ES: 5m, 15m, 4h, 1d")
+    direction: str = Field(..., pattern="^(LONG|SHORT)$")
+    strength_class: str = Field(..., description="Es: A, A_PLUS")
+    risk_pct: float = Field(..., gt=0, description="Es: 0.008 per 0.8%")
+    ts_signal: str = Field(..., description="ISO8601 UTC timestamp")
+    user_id: Optional[str] = Field("TEST_USER_001", description="ID utente/tenant")
+    meta: Optional[TradeIntentMeta] = None
+
+
+# ======================
+# ENDPOINT DI BASE
+# ======================
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
+
+
+@app.get("/dbtest")
+def dbtest():
+    """Test rapido connessione DB globale."""
+    if engine is None:
+        raise HTTPException(status_code=500, detail="engine not initialized (DB env missing)")
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1")).scalar()
+        return {"db": result}
+    except Exception as e:
+        logging.exception("dbtest failed")
+        raise HTTPException(status_code=500, detail=f"db error: {e}")
+
+
+@app.post("/migrate", response_class=PlainTextResponse)
+def migrate():
+    if engine is None:
+        raise HTTPException(status_code=500, detail="engine not initialized")
+    metadata.create_all(engine)
+    return "migrated"
+
+
+@app.post("/worker", response_class=PlainTextResponse)
+def worker():
+    # placeholder: in futuro processeremo il job (trade singolo utente) in modo async
+    return "worker-ack"
+
+
+# ======================
+# MOCK /tick (disabilitato, ma lasciato per retrocompatibilità)
+# ======================
+
+@app.post("/tick", response_class=PlainTextResponse)
+async def tick():
+    try:
+        PROJECT = _project_id()
+        if not PROJECT:
+            raise RuntimeError("Missing project id env")
+
+        # Non usiamo più Cloud Tasks per questo; la Coscienza v3 parlerà con /v1/trade-intent.
+        return "tick-disabled: use /v1/trade-intent from Coscienza v3"
+    except Exception as e:
+        logging.exception("tick failed")
+        return PlainTextResponse(f"tick-error: {e}", status_code=500)
+
+
+# ======================
+# ARBI BLOCK (già usato)
+# ======================
+
+@app.get("/arbi/block")
+def arbi_block():
+    url = os.environ.get("ALCHEMY_HTTP_ARBITRUM") or os.environ.get("ARBITRUM_RPC_URL")
+    if not url:
+        raise HTTPException(
+            status_code=500,
+            detail="ALCHEMY_HTTP_ARBITRUM/ARBITRUM_RPC_URL not set",
+        )
+    body = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        payload = json.loads(r.read().decode())
+    res = payload.get("result")
+    height = int(res, 16) if isinstance(res, str) else None
+    return {"ok": True, "height": height, "result": res}
+
+
+# ======================
+# PYTH PRICE HELPER (ancora esposto)
+# ======================
+
+@app.get("/pyth/price")
+async def pyth_price(id: str = Query(..., description="Pyth price feed id (0x...)")):
+    """Chiama Hermes con un singolo feed id e ritorna il last price."""
+    try:
+        url_base = (
+            globals().get("PYTH_HERMES_URL")
+            or os.environ.get("PYTH_HERMES_URL")
+            or "https://hermes.pyth.network"
+        )
+        if not id.startswith("0x") or len(id) < 10:
+            raise HTTPException(status_code=400, detail="invalid feed id")
+        url = url_base.rstrip("/") + "/api/latest_price_feeds"
+        params = {"ids[]": [id]}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+        if not data:
+            return {"ok": False, "id": id, "reason": "not found"}
+        item = data[0]
+        price = item.get("price", {})
+        px, expo = price.get("price"), price.get("expo", 0)
+        out = float(px) * (10 ** float(expo)) if px is not None else None
+        return {"ok": True, "id": id, "price": out, "raw": item}
+    except httpx.HTTPError as e:
+        logging.exception("hermes http error")
+        raise HTTPException(status_code=502, detail=f"hermes error: {e}") from e
+    except Exception as e:
+        logging.exception("pyth_price failed")
+        raise HTTPException(status_code=500, detail=f"internal error: {e}") from e
+
+
+# ======================
+# 🔥 /v1/trade-intent – cuore dell’autotrader
+# ======================
+
+@app.post("/v1/trade-intent")
+async def v1_trade_intent(
+    intent: TradeIntentIn,
+    x_api_key: Optional[str] = Header(None),
+):
+    # DEBUG: vedere cosa arriva davvero
+    logging.info("X-API-Key header received: %r", x_api_key)
+
+    # 1) AUTH
+    if COORD_API_KEY:
+        if not x_api_key or x_api_key != COORD_API_KEY:
+            logging.error(
+                "API KEY MISMATCH: header=%r expected=%r",
+                x_api_key,
+                COORD_API_KEY,
+            )
+            raise HTTPException(status_code=401, detail="invalid api key")
+
+    # 2) Validazione simbolo
+    symbol = intent.symbol.upper()
+    if symbol not in executor.COSCIENZA_SYMBOLS_V3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"symbol {symbol} not in allowed universe",
+        )
+
+    if engine is None:
+        raise HTTPException(status_code=500, detail="engine not initialized")
+
+    # 3) Serializza intent in dict “piatto”
+    intent_dict: Dict[str, Any] = intent.model_dump()
+    intent_dict["symbol"] = symbol
+
+    try:
+        result = await executor.process_trade_intent(engine, intent_dict)
+        return result
+    except Exception as e:
+        logging.exception("process_trade_intent failed")
+        return {
+            "intent_id": None,
+            "status": "ERROR",
+            "message": str(e),
+        }
+
+
+
+
+# ======================
+# 🔁 RECONCILER ISTITUZIONALE
+# ======================
+
+@app.post("/v1/reconcile")
+async def reconcile_positions(
+    x_api_key: str = Header(default=""),
+    limit_tenants: int = Query(200, ge=1, le=2000),
+):
+    """
+    Reconciler istituzionale (VERITÀ BROKER):
+    - legge tenants con metaapi_account_id
+    - legge posizioni OPEN reali dal broker (MetaApi)
+    - upsert su public.positions via (tenant_id, provider_account_id, provider_position_id)
+    - chiude in DB le posizioni OPEN non più presenti sul broker
+    - aggiorna executions (best-effort) con CLOSED_BROKER
+    """
+
+    # AUTH
+    if COORD_API_KEY and x_api_key != COORD_API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    if engine is None:
+        raise HTTPException(status_code=500, detail="engine not initialized")
+
+    if not METAAPI_TOKEN:
+        raise HTTPException(status_code=500, detail="METAAPI_TOKEN missing (required for reconcile)")
+
+    now = datetime.now(timezone.utc)
+
+    async def metaapi_get(account_id: str, suffix: str):
+        url = METAAPI_API_BASE.rstrip("/") + f"/users/current/accounts/{account_id}" + suffix
+        headers = {"auth-token": METAAPI_TOKEN, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code >= 300:
+                raise HTTPException(status_code=502, detail={"metaapi_http": r.status_code, "body": r.text, "url": url})
+            return r.json()
+
+    # 1) tenants to reconcile
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT id::text AS tenant_id, email, metaapi_account_id
+            FROM tenants
+            WHERE metaapi_account_id IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), {"lim": int(limit_tenants)}).mappings().all()
+
+    tenants_list = [dict(r) for r in rows]
+    if not tenants_list:
+        return {"ok": True, "tenants": 0, "positions_upserted": 0, "positions_closed": 0, "executions_updated": 0, "ts": now.isoformat()}
+
+    positions_upserted = 0
+    positions_closed = 0
+    executions_updated = 0
+
+    for t in tenants_list:
+        tenant_id = t["tenant_id"]
+        account_id = (t["metaapi_account_id"] or "").strip()
+        if not account_id:
+            continue
+
+        # broker truth: open positions
+        open_positions = await metaapi_get(account_id, "/positions")
+        if not isinstance(open_positions, list):
+            open_positions = []
+
+        broker_open_ids = set()
+
+        with engine.begin() as conn:
+            # upsert open positions
+            for bp in open_positions:
+                pos_id = str(bp.get("id") or bp.get("positionId") or bp.get("ticket") or "")
+                if not pos_id:
+                    continue
+                broker_open_ids.add(pos_id)
+
+                symbol = (bp.get("symbol") or "").strip().upper()
+                typ = (bp.get("type") or "").upper()
+                side = "SHORT" if "SELL" in typ else "LONG"
+
+                entry_price = bp.get("openPrice") or bp.get("priceOpen") or bp.get("open_price")
+                # size_usdc legacy for CeFi: keep 0 for now (we'll add lots/units later)
+                provider_order_id = str(bp.get("orderId") or bp.get("order_id") or "")
+
+                res = conn.execute(text("""
+                    UPDATE positions
+                    SET symbol=:symbol,
+                        side=:side,
+                        entry_price=COALESCE(:entry_price, entry_price),
+                        status='OPEN',
+                        provider_order_id=COALESCE(NULLIF(:provider_order_id,''), provider_order_id),
+                        updated_at=:now
+                    WHERE tenant_id=:tenant_id
+                      AND provider_account_id=:provider_account_id
+                      AND provider_position_id=:provider_position_id
+                """), {
+                    "tenant_id": tenant_id,
+                    "provider_account_id": account_id,
+                    "provider_position_id": pos_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "provider_order_id": provider_order_id,
+                    "now": now,
+                })
+
+                if res.rowcount == 0:
+                    conn.execute(text("""
+                        INSERT INTO positions
+                          (tenant_id, symbol, side, size_usdc, entry_price, status, opened_at,
+                           provider_account_id, provider_position_id, provider_order_id, updated_at)
+                        VALUES
+                          (:tenant_id::uuid, :symbol, :side, :size_usdc, :entry_price, 'OPEN', :opened_at,
+                           :provider_account_id, :provider_position_id, :provider_order_id, :now)
+                    """), {
+                        "tenant_id": tenant_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "size_usdc": 0.0,
+                        "entry_price": entry_price,
+                        "opened_at": now,
+                        "provider_account_id": account_id,
+                        "provider_position_id": pos_id,
+                        "provider_order_id": provider_order_id,
+                        "now": now,
+                    })
+
+                positions_upserted += 1
+
+                        # build PG array literal for open_ids (works even when empty)
+            open_ids_literal = "{" + ",".join(sorted(broker_open_ids)) + "}"
+            # close DB positions not present on broker anymore
+            closed = conn.execute(text("""
+                UPDATE positions
+                SET status='CLOSED',
+                    closed_at=COALESCE(closed_at, :now),
+                    close_reason=COALESCE(close_reason, 'BROKER_CLOSED'),
+                    updated_at=:now
+                WHERE tenant_id=:tenant_id
+                  AND provider_account_id=:provider_account_id
+                  AND status='OPEN'
+                  AND provider_position_id IS NOT NULL
+                  AND (
+                    coalesce(array_length(CAST(:open_ids AS text[]), 1), 0) = 0
+                    OR NOT (provider_position_id = ANY(CAST(:open_ids AS text[])))
+                  )
+            """), {"tenant_id": tenant_id, "provider_account_id": account_id, "open_ids": open_ids_literal, "now": now})
+
+            if closed.rowcount:
+                positions_closed += int(closed.rowcount)
+
+                exu = conn.execute(text("""
+                    UPDATE executions
+                    SET status='CLOSED_BROKER',
+                        closed_at=COALESCE(closed_at, :now),
+                        close_reason=COALESCE(close_reason, 'BROKER_CLOSED'),
+                        updated_at=:now
+                    WHERE tenant_id=:tenant_id
+                      AND provider_account_id=:provider_account_id
+                      AND status IN ('SUBMITTED','OPEN')
+                      AND provider_position_id IS NOT NULL
+                      AND (
+                        coalesce(array_length(CAST(:open_ids AS text[]), 1), 0) = 0
+                        OR NOT (provider_position_id = ANY(CAST(:open_ids AS text[])))
+                      )
+                """), {"tenant_id": tenant_id, "provider_account_id": account_id, "open_ids": open_ids_literal, "now": now})
+                executions_updated += int(exu.rowcount or 0)
+
+    return {
+        "ok": True,
+        "tenants": len(tenants_list),
+        "positions_upserted": positions_upserted,
+        "positions_closed": positions_closed,
+        "executions_updated": executions_updated,
+        "ts": now.isoformat(),
+    }
+
+
+# ============================
+# ADMIN ENDPOINT - SEED TEST USER
+# ============================
+
+@app.post("/admin/seed-test-user")
+def admin_seed_test_user(
+    x_admin_seed_key: str = Header(default=""),  # X-Admin-Seed-Key
+):
+    """
+    Endpoint admin per creare/assicurare TEST_USER_001 nel DB,
+    associato al wallet TEST_USER_WALLET.
+    Protetto da header:
+      X-Admin-Seed-Key: <ADMIN_SEED_KEY>
+    """
+    from executor import ensure_test_user
+
+    # 1) Controllo chiave admin
+    admin_key = os.getenv("ADMIN_SEED_KEY", "")
+    if not admin_key:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_SEED_KEY not configured",
+        )
+
+    if x_admin_seed_key != admin_key:
+        raise HTTPException(status_code=401, detail="invalid admin key")
+
+    # 2) Controllo engine
+    if engine is None:
+        raise HTTPException(status_code=500, detail="engine not initialized")
+
+    # 3) Wallet di test
+    test_wallet = os.getenv("TEST_USER_WALLET") or os.getenv("RELAYER_ADDRESS")
+    if not test_wallet:
+        raise HTTPException(
+            status_code=500,
+            detail="TEST_USER_WALLET or RELAYER_ADDRESS missing",
+        )
+
+    # 4) Creo/assicuro utente di test
+    ensure_test_user(engine, "TEST_USER_001", test_wallet)
+
+    return {
+        "ok": True,
+        "user_id": "TEST_USER_001",
+        "wallet": test_wallet,
+    }
+
+
+# ============ DEBUG ADMIN SEED ============
+
+@app.post("/admin/seed-test-user-debug", response_class=PlainTextResponse)
+async def admin_seed_test_user_debug(request: Request):
+    from executor import ensure_test_user
+
+    admin_key = os.getenv("ADMIN_SEED_KEY", "")
+    if not admin_key:
+        return PlainTextResponse(
+            "admin-error: ADMIN_SEED_KEY not configured",
+            status_code=500,
+        )
+
+    hdr = request.headers.get("X-Admin-Seed-Key")
+    if hdr != admin_key:
+        return PlainTextResponse(
+            f"admin-error: bad key hdr={hdr!r}",
+            status_code=401,
+        )
+
+    if engine is None:
+        return PlainTextResponse(
+            "admin-error: engine not initialized",
+            status_code=500,
+        )
+
+    test_wallet = os.getenv("TEST_USER_WALLET") or os.getenv("RELAYER_ADDRESS")
+    if not test_wallet:
+        return PlainTextResponse(
+            "admin-error: TEST_USER_WALLET/RELAYER_ADDRESS missing",
+            status_code=500,
+        )
+
+    try:
+        ensure_test_user(engine, "TEST_USER_001", test_wallet)
+        return PlainTextResponse(
+            f"seed-ok TEST_USER_001 {test_wallet}",
+            status_code=200,
+        )
+    except Exception as e:
+        logging.exception("admin seed debug failed")
+        return PlainTextResponse(
+            f"admin-error exception: {e}",
+            status_code=500,
+        )

@@ -1,0 +1,248 @@
+"""
+router_cefi.py
+
+Cerbero Coordinator (CeFi) — Governor + Router.
+
+Responsabilità:
+- Validazione istituzionale (B1/B2) [qui inseriremo i limiti]
+- Audit DB minimo (tabella signals)
+- Forward dell'intent verso executor-cefi (Cloud Run)
+
+NOTA: Questo modulo NON deve contenere:
+- Pyth / Hermes
+- Web3 / Arbitrum
+- Ponte / on-chain
+"""
+
+import os
+import json
+import uuid
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+
+import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "").rstrip("/")
+EXECUTOR_API_KEY = os.getenv("EXECUTOR_API_KEY", "")
+
+# ======================
+# B2 GOVERNOR CONFIG (istituzionale)
+# ======================
+B2_GOVERNOR_CONFIG = {
+    # max posizioni OPEN per simbolo (istituzionale)
+    "MAX_OPEN_PER_SYMBOL": int(os.getenv("B2_MAX_OPEN_PER_SYMBOL", "1")),
+    # cooldown tra eventi sul simbolo (open/close/block) in secondi
+    "COOLDOWN_SEC": int(os.getenv("B2_COOLDOWN_SEC", "300")),
+    # exposure placeholder (NON blocchiamo ora in CeFi finché non abbiamo lots->USD)
+    "MAX_EXPOSURE_USD": float(os.getenv("B2_MAX_EXPOSURE_USD", "0")),
+}
+
+
+# ======================
+# DB HELPERS (audit minimo)
+# ======================
+
+def get_or_create_signal(engine: Engine, intent: Dict[str, Any]) -> uuid.UUID:
+    """
+    Audit minimale: inserisce una riga in signals e ritorna signal_id.
+
+    NB: score/p/e/r/v rimangono placeholder fino a quando non decidiamo
+    lo schema definitivo del DB istituzionale (Blocco C).
+    """
+    symbol = intent["symbol"]
+    created_at = datetime.now(timezone.utc)
+
+    str_id = str(uuid.uuid4())
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO signals (id, symbol, score, p, e, r, v, created_at)
+                VALUES (:id, :symbol, :score, :p, :e, :r, :v, :created_at)
+            """),
+            {
+                "id": str_id,
+                "symbol": symbol,
+                "score": 1.0,
+                "p": 0.0,
+                "e": 0.0,
+                "r": 0.0,
+                "v": 0.0,
+                "created_at": created_at,
+            },
+        )
+
+    return uuid.UUID(str_id)
+
+
+
+# ======================
+# TENANT RESOLUTION
+# ======================
+def _get_tenant_id_by_email(engine: Engine, email: str) -> uuid.UUID:
+    em = (email or "").strip().lower()
+    if not em:
+        raise ValueError("missing tenant email/user_id")
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT id FROM tenants WHERE email=:email"), {"email": em}).fetchone()
+        if row and row[0]:
+            return uuid.UUID(str(row[0]))
+        # create tenant on the fly (istituzionale: sempre tracciabile)
+        tid = str(uuid.uuid4())
+        conn.execute(
+            text("INSERT INTO tenants (id, email, created_at) VALUES (:id::uuid, :email, now())"),
+            {"id": tid, "email": em},
+        )
+        return uuid.UUID(tid)
+
+# ======================
+# GOVERNOR (placeholder)
+# ======================
+
+def governor_check(engine: Engine, intent: Dict[str, Any]) -> Optional[str]:
+    """B2 istituzionale.
+    - max open per symbol
+    - cooldown per symbol (open/close/block)
+    Exposure: placeholder (non blocchiamo ancora).
+    """
+    symbol = (intent.get("symbol") or "").strip().upper()
+    user_id = (intent.get("user_id") or intent.get("tenant_email") or "").strip().lower()
+    if not symbol:
+        return "missing_symbol"
+    if not user_id:
+        return "missing_user_id"
+
+    tid = _get_tenant_id_by_email(engine, user_id)
+    max_open = int(B2_GOVERNOR_CONFIG.get("MAX_OPEN_PER_SYMBOL", 1))
+    cooldown = int(B2_GOVERNOR_CONFIG.get("COOLDOWN_SEC", 300))
+
+    with engine.begin() as conn:
+        # 1) max open per symbol
+        open_cnt = conn.execute(
+            text("""
+                SELECT count(*)
+                FROM positions
+                WHERE tenant_id=:tenant_id::uuid
+                  AND symbol=:symbol
+                  AND status='OPEN'
+            """),
+            {"tenant_id": str(tid), "symbol": symbol},
+        ).scalar() or 0
+        if int(open_cnt) >= max_open:
+            return f"max_open_per_symbol_reached({open_cnt}/{max_open})"
+
+        # 2) cooldown per symbol (usiamo l'evento più recente su executions/positions)
+        last_ts = conn.execute(
+            text("""
+                SELECT max(ts) FROM (
+                  SELECT max(coalesce(updated_at, created_at)) as ts
+                  FROM executions
+                  WHERE tenant_id=:tenant_id::uuid AND symbol=:symbol
+                  UNION ALL
+                  SELECT max(coalesce(updated_at, opened_at)) as ts
+                  FROM positions
+                  WHERE tenant_id=:tenant_id::uuid AND symbol=:symbol
+                ) q
+            """),
+            {"tenant_id": str(tid), "symbol": symbol},
+        ).scalar()
+
+        if last_ts is not None:
+            # last_ts è tz-aware in DB
+            now = datetime.now(timezone.utc)
+            delta = (now - last_ts).total_seconds()
+            if delta < cooldown:
+                return f"cooldown_active({int(cooldown - delta)}s_left)"
+
+    return None
+
+
+
+# ======================
+# FORWARD → EXECUTOR-CEFI
+# ======================
+
+async def forward_to_executor_cefi(intent: Dict[str, Any]) -> Dict[str, Any]:
+    if not EXECUTOR_BASE_URL:
+        raise RuntimeError("EXECUTOR_BASE_URL not configured")
+
+    url = f"{EXECUTOR_BASE_URL}/v1/execute"
+
+    headers = {"Content-Type": "application/json"}
+    if EXECUTOR_API_KEY:
+        headers["X-API-Key"] = EXECUTOR_API_KEY
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, headers=headers, json=intent)
+        r.raise_for_status()
+        return r.json()
+
+
+# ======================
+# ENTRY POINT
+# ======================
+
+async def process_trade_intent(engine: Engine, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Chiamata da main.py /v1/trade-intent.
+    """
+    symbol = intent.get("symbol")
+    user_id = intent.get("user_id")
+
+    # 1) Governor (B2)
+    reason = governor_check(engine, intent)
+    if reason:
+        logging.warning("GOVERNOR BLOCK: %s symbol=%s user=%s", reason, symbol, user_id)
+
+        # Audit istituzionale: scrivi una execution BLOCKED_GOVERNOR (serve anche per cooldown)
+        try:
+            tid = _get_tenant_id_by_email(engine, user_id or "")
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO executions
+                          (id, tenant_id, provider, symbol, side, status, error_message, request_payload, created_at, updated_at)
+                        VALUES
+                          (:id::uuid, :tenant_id::uuid, :provider, :symbol, :side, 'BLOCKED_GOVERNOR', :err, :payload::jsonb, now(), now())
+                    """),
+                    {
+                        "id": str(uuid.uuid4()),
+                        "tenant_id": str(tid),
+                        "provider": "metaapi",
+                        "symbol": symbol,
+                        "side": str(intent.get("direction") or intent.get("side") or "").upper() or "LONG",
+                        "err": str(reason),
+                        "payload": json.dumps(intent),
+                    },
+                )
+        except Exception as _e:
+            logging.exception("failed to audit BLOCKED_GOVERNOR: %s", _e)
+
+        return {
+            "intent_id": None,
+            "status": "BLOCKED",
+            "message": reason,
+            "symbol": symbol,
+            "user_id": user_id,
+        }
+
+    # 2) Audit DB minimo
+    signal_id = get_or_create_signal(engine, intent)
+
+    # 3) Forward a executor-cefi
+    exec_res = await forward_to_executor_cefi(intent)
+
+    # 4) Risposta unica normalizzata
+    return {
+        "intent_id": exec_res.get("intent_id"),
+        "status": exec_res.get("status", "FORWARDED"),
+        "message": exec_res.get("message", "forwarded to executor-cefi"),
+        "symbol": symbol,
+        "user_id": user_id,
+        "signal_id": str(signal_id),
+        "executor": exec_res,
+    }

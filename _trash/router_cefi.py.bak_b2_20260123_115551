@@ -1,0 +1,142 @@
+"""
+router_cefi.py
+
+Cerbero Coordinator (CeFi) — Governor + Router.
+
+Responsabilità:
+- Validazione istituzionale (B1/B2) [qui inseriremo i limiti]
+- Audit DB minimo (tabella signals)
+- Forward dell'intent verso executor-cefi (Cloud Run)
+
+NOTA: Questo modulo NON deve contenere:
+- Pyth / Hermes
+- Web3 / Arbitrum
+- Ponte / on-chain
+"""
+
+import os
+import uuid
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+
+import httpx
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "").rstrip("/")
+EXECUTOR_API_KEY = os.getenv("EXECUTOR_API_KEY", "")
+
+
+# ======================
+# DB HELPERS (audit minimo)
+# ======================
+
+def get_or_create_signal(engine: Engine, intent: Dict[str, Any]) -> uuid.UUID:
+    """
+    Audit minimale: inserisce una riga in signals e ritorna signal_id.
+
+    NB: score/p/e/r/v rimangono placeholder fino a quando non decidiamo
+    lo schema definitivo del DB istituzionale (Blocco C).
+    """
+    symbol = intent["symbol"]
+    created_at = datetime.now(timezone.utc)
+
+    str_id = str(uuid.uuid4())
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO signals (id, symbol, score, p, e, r, v, created_at)
+                VALUES (:id, :symbol, :score, :p, :e, :r, :v, :created_at)
+            """),
+            {
+                "id": str_id,
+                "symbol": symbol,
+                "score": 1.0,
+                "p": 0.0,
+                "e": 0.0,
+                "r": 0.0,
+                "v": 0.0,
+                "created_at": created_at,
+            },
+        )
+
+    return uuid.UUID(str_id)
+
+
+# ======================
+# GOVERNOR (placeholder)
+# ======================
+
+def governor_check(intent: Dict[str, Any]) -> Optional[str]:
+    """
+    Ritorna None se OK, altrimenti una stringa 'reason' per bloccare il trade.
+
+    Qui implementeremo B2 (max trades, per symbol, cooldown, esposizione, autopilot...)
+    appena finiamo la mappatura del flusso executor-cefi + schema DB.
+    """
+    # TODO(B2): implementare limiti istituzionali
+    return None
+
+
+# ======================
+# FORWARD → EXECUTOR-CEFI
+# ======================
+
+async def forward_to_executor_cefi(intent: Dict[str, Any]) -> Dict[str, Any]:
+    if not EXECUTOR_BASE_URL:
+        raise RuntimeError("EXECUTOR_BASE_URL not configured")
+
+    url = f"{EXECUTOR_BASE_URL}/v1/execute"
+
+    headers = {"Content-Type": "application/json"}
+    if EXECUTOR_API_KEY:
+        headers["X-API-Key"] = EXECUTOR_API_KEY
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, headers=headers, json=intent)
+        r.raise_for_status()
+        return r.json()
+
+
+# ======================
+# ENTRY POINT
+# ======================
+
+async def process_trade_intent(engine: Engine, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Chiamata da main.py /v1/trade-intent.
+    """
+    symbol = intent.get("symbol")
+    user_id = intent.get("user_id")
+
+    # 1) Governor (B2)
+    reason = governor_check(intent)
+    if reason:
+        logging.warning("GOVERNOR BLOCK: %s symbol=%s user=%s", reason, symbol, user_id)
+        return {
+            "intent_id": None,
+            "status": "BLOCKED",
+            "message": reason,
+            "symbol": symbol,
+            "user_id": user_id,
+        }
+
+    # 2) Audit DB minimo
+    signal_id = get_or_create_signal(engine, intent)
+
+    # 3) Forward a executor-cefi
+    exec_res = await forward_to_executor_cefi(intent)
+
+    # 4) Risposta unica normalizzata
+    return {
+        "intent_id": exec_res.get("intent_id"),
+        "status": exec_res.get("status", "FORWARDED"),
+        "message": exec_res.get("message", "forwarded to executor-cefi"),
+        "symbol": symbol,
+        "user_id": user_id,
+        "signal_id": str(signal_id),
+        "executor": exec_res,
+    }
